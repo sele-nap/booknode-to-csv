@@ -23,13 +23,13 @@ Génère un fichier `booknode_<pseudo>_export.csv`.
 
 ## Étagères exportées
 
-| BookNode | Goodreads |
-|---|---|
-| Lu | read |
-| En cours | currently-reading |
-| À lire | to-read |
-| Wishlist | to-read |
-| Abandonné | read |
+| BookNode  | Goodreads         |
+| --------- | ----------------- |
+| Lu        | read              |
+| En cours  | currently-reading |
+| À lire    | to-read           |
+| Wishlist  | to-read           |
+| Abandonné | read              |
 
 ## Notes
 
