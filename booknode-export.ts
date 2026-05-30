@@ -1,383 +1,234 @@
 import axios from 'axios';
 import * as cheerio from 'cheerio';
-import { Element } from 'domhandler';
-import { createWriteStream, writeFileSync } from 'fs';
+import { writeFileSync } from 'fs';
 
-// ── CONFIG ────────────────────────────────────────────────────────────────────
-const CONFIG = {
-  username: process.env.BN_USERNAME ?? 'ton_username',
-  password: process.env.BN_PASSWORD ?? 'ton_mdp',
-};
-
-// ── CLI ───────────────────────────────────────────────────────────────────────
-// npx ts-node booknode-export.ts <profileSlug> [--debug [shelf]]
-const rawArgs = process.argv.slice(2);
-const debugIdx = rawArgs.indexOf('--debug');
-const DEBUG = debugIdx !== -1;
-const debugShelfArg = rawArgs[debugIdx + 1];
-const DEBUG_SHELF =
-  DEBUG && debugShelfArg && !debugShelfArg.startsWith('-')
-    ? debugShelfArg
-    : null;
-const USERNAME = rawArgs.find((a) => !a.startsWith('-')) ?? '';
+// Usage: npx ts-node booknode-export.ts <profileSlug|userId> [--debug] [--no-isbn]
+const args     = process.argv.slice(2);
+const DEBUG    = args.includes('--debug');
+const NO_ISBN  = args.includes('--no-isbn');
+const USERNAME = args.find((a) => !a.startsWith('-')) ?? '';
 
 if (!USERNAME) {
-  console.error(
-    'Usage: npx ts-node booknode-export.ts <profileSlug> [--debug [shelf]]',
-  );
+  console.error('Usage: npx ts-node booknode-export.ts <profileSlug|userId> [--no-isbn]');
   process.exit(1);
 }
 
-// ── CONSTANTS ─────────────────────────────────────────────────────────────────
 const BASE_URL = 'https://booknode.com';
-const LOGIN_POST_PATH = '/backend/router.php';
-const DELAY_MS = 800;
-const SHELF_MAP: Record<string, string> = {
-  lu: 'read',
-  'en-cours': 'currently-reading',
-  'a-lire': 'to-read',
-  wishlist: 'to-read',
-  abandonne: 'read',
-};
-const BASE_HEADERS = {
-  'User-Agent':
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36',
+const HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36',
   'Accept-Language': 'fr-FR,fr;q=0.9',
   Accept: 'text/html,application/xhtml+xml,*/*;q=0.8',
 };
 
-interface Book {
-  title: string;
-  author: string;
-  isbn: string;
-  myRating: number;
-  shelf: string;
-  dateRead: string;
-  dateAdded: string;
-  review: string;
-}
+// BookNode has no individual ratings — the list determines the star count.
+const LIST_MAP: Record<number, { shelf: string; rating: number } | null> = {
+  1:  { shelf: 'read',              rating: 5 }, // Diamond
+  2:  { shelf: 'read',              rating: 4 }, // Gold
+  3:  { shelf: 'read',              rating: 3 }, // Silver
+  4:  { shelf: 'read',              rating: 2 }, // Bronze
+  5:  { shelf: 'read',              rating: 0 }, // Also read
+  6:  { shelf: 'to-read',           rating: 0 }, // Wishlist
+  7:  null,                                       // Trash — skipped
+  8:  { shelf: 'currently-reading', rating: 0 }, // Currently reading
+  9:  { shelf: 'read',              rating: 0 }, // Did not enjoy
+  10: { shelf: 'to-read',           rating: 0 }, // To-read pile
+};
+
+// Hoisted so it isn't recompiled on every resolveIsbn call
+const VOLUME_RE = /,?\s*(tome|vol\.?|volume|t\.|partie|part)\s*\d+/gi;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-// ── COOKIE STORE ──────────────────────────────────────────────────────────────
-// Gestion manuelle des cookies pour éviter les dépendances externes.
-// La session cookie vient uniquement du 302 du login — pas besoin de jar complet.
-const cookieStore: Record<string, string> = {};
+// ── Types ─────────────────────────────────────────────────────────────────────
+interface ApiBook {
+  type: 'creative';
+  id: number;
+  name: string;
+  person: { _prenom: string; _nom: string; nom: string };
+}
+interface ApiGroupRef { type: 'group'; id: number }
+interface ApiResponse {
+  front_content: Record<string, (ApiBook | ApiGroupRef)[]>;
+  groups: Record<string, { content: ApiBook[] }>;
+}
+interface Book {
+  title: string;
+  author: string;
+  authorLF: string; // "Last, First" — built from structured API fields
+  myRating: number;
+  shelf: string;
+  isbn: string;
+  isbn13: string;
+}
 
-function storeCookies(setCookieHeader: string[] | string | undefined): void {
-  for (const raw of [setCookieHeader ?? []].flat()) {
-    const [pair] = raw.split(';');
-    const eq = pair.indexOf('=');
-    if (eq > 0)
-      cookieStore[pair.slice(0, eq).trim()] = pair.slice(eq + 1).trim();
+// ── Step 1: resolve userId ────────────────────────────────────────────────────
+async function fetchUserId(): Promise<string> {
+  if (/^\d+$/.test(USERNAME)) return USERNAME;
+
+  console.log(`🔍 Looking up user ID for "${USERNAME}"...`);
+  for (const path of [`/profil/${USERNAME}/biblio`, `/profil/${USERNAME}/bibliotheque`]) {
+    try {
+      const { data: html } = await axios.get(`${BASE_URL}${path}`, {
+        headers: HEADERS, maxRedirects: 5, validateStatus: (s) => s < 500,
+      });
+      const userId = cheerio.load(html as string)('main[data-id]').attr('data-id');
+      if (userId) { console.log(`   userId = ${userId}\n`); return userId; }
+    } catch { /* try next path */ }
   }
+  throw new Error(
+    `Could not find user ID for "${USERNAME}".\n` +
+    `  → Pass it directly: npx ts-node booknode-export.ts 501202`,
+  );
 }
 
-function cookieString(): string {
-  return Object.entries(cookieStore)
-    .map(([k, v]) => `${k}=${v}`)
-    .join('; ');
-}
-
-// ── HTTP HELPERS ──────────────────────────────────────────────────────────────
-function get(path: string) {
-  return axios.get(`${BASE_URL}${path}`, {
-    headers: { ...BASE_HEADERS, Cookie: cookieString() },
-    maxRedirects: 5,
+// ── Step 2: fetch library ─────────────────────────────────────────────────────
+async function fetchLibrary(userId: string): Promise<ApiResponse> {
+  console.log('📚 Loading library...');
+  const { data } = await axios.get(`${BASE_URL}/biblio-api/load/${userId}`, {
+    headers: { ...HEADERS, Accept: 'application/json' },
   });
+  return data as ApiResponse;
 }
 
-function post(path: string, data: string) {
-  // maxRedirects: 0 pour capturer les cookies du 302 avant la redirection
-  return axios.post(`${BASE_URL}${path}`, data, {
-    headers: {
-      ...BASE_HEADERS,
-      Cookie: cookieString(),
-      'Content-Type': 'application/x-www-form-urlencoded',
-    },
-    maxRedirects: 0,
-    validateStatus: (s) => s < 400,
-  });
-}
-
-// ── LOGIN ─────────────────────────────────────────────────────────────────────
-async function login(): Promise<void> {
-  console.log('🔑 Connexion à BookNode...');
-
-  // Établit la session cookie avant le login
-  const homePage = await get('/');
-  storeCookies(homePage.headers['set-cookie'] as string[] | undefined);
-
-  const loginRes = await post(
-    LOGIN_POST_PATH,
-    new URLSearchParams({
-      action: 'logmein',
-      u: CONFIG.username,
-      p: CONFIG.password,
-    }).toString(),
-  );
-  storeCookies(loginRes.headers['set-cookie'] as string[] | undefined);
-
-  const loginJson = loginRes.data as Record<string, unknown>;
-  console.log(
-    '   Cookies stockés :',
-    Object.keys(cookieStore).join(', ') || '(aucun)',
-  );
-  console.log('   Réponse login    :', JSON.stringify(loginJson));
-
-  if (!loginJson.ok && loginJson.ok !== 1) {
-    console.error(
-      '❌ Login échoué :',
-      loginJson.msg ?? loginJson.error ?? JSON.stringify(loginJson),
-    );
-    process.exit(1);
-  }
-
-  console.log('✅ Connecté !\n');
-}
-
-// ── DEBUG ─────────────────────────────────────────────────────────────────────
-// --debug <shelf>   → dump /profil/{slug}/bibliotheque?shelf=<shelf>&page=1
-// --debug <url>     → dump l'URL exacte si ça commence par /
-async function dumpHtml(target: string, page = 1): Promise<void> {
-  const isRawPath = target.startsWith('/');
-  const path = isRawPath
-    ? target
-    : `/profil/${USERNAME}/bibliotheque?shelf=${target}&page=${page}`;
-
-  console.log(`🔍 Debug — fetching: ${BASE_URL}${path}\n`);
-
-  const res = await axios.get(`${BASE_URL}${path}`, {
-    headers: { ...BASE_HEADERS, Cookie: cookieString() },
-    maxRedirects: 5,
-    validateStatus: () => true,
-  });
-
-  const filename = `debug_${target.replace(/\//g, '_').replace(/[?&=]/g, '-')}.html`;
-  writeFileSync(filename, res.data as string, 'utf8');
-
-  console.log(`✅ Status ${res.status} → ${filename}`);
-  console.log(
-    '   Ouvre dans ton navigateur pour repérer la vraie structure des URLs et des sélecteurs CSS.\n',
-  );
-}
-
-// ── SCRAPING ──────────────────────────────────────────────────────────────────
-function parseRating($el: cheerio.Cheerio<Element>): number {
-  const dataNoteAttr = $el.attr('data-note');
-  if (dataNoteAttr) return Math.round(parseFloat(dataNoteAttr));
-
-  const cls = $el.attr('class') ?? '';
-  const match = cls.match(/note_(\d)/);
-  if (match) return parseInt(match[1], 10);
-
-  const full = $el.find('.heart_full, .fa-heart, .icon-heart-filled').length;
-  return Math.min(full, 5);
-}
-
-async function fetchBooksPage(
-  shelf: string,
-  page: number,
-): Promise<{ books: Book[]; hasNext: boolean }> {
-  const { data: html } = await get(
-    `/profil/${USERNAME}/bibliotheque?shelf=${shelf}&page=${page}`,
-  );
-  const $ = cheerio.load(html as string);
+// ── Step 3: flatten to books ──────────────────────────────────────────────────
+function extractBooks(library: ApiResponse): Book[] {
   const books: Book[] = [];
 
-  $(".book_item, .livre_item, [class*='book-item'], li.book").each((_, el) => {
-    const $el = $(el);
+  for (const [listIdStr, items] of Object.entries(library.front_content)) {
+    const mapping = LIST_MAP[parseInt(listIdStr, 10)];
+    if (!mapping) continue;
 
-    const title =
-      $el
-        .find(".book_title, .titre, [itemprop='name'], .title a")
-        .first()
-        .text()
-        .trim() ||
-      $el.find("a.book_link, a[href*='/livre/']").first().text().trim();
+    for (const item of items) {
+      const creatives =
+        item.type === 'creative'
+          ? [item as ApiBook]
+          : library.groups[String(item.id)]?.content ?? [];
 
-    if (!title) return;
-
-    const author = $el
-      .find(".book_author, .auteur, [itemprop='author']")
-      .first()
-      .text()
-      .trim();
-
-    const isbn =
-      $el.find("[itemprop='isbn']").attr('content') ??
-      $el.attr('data-isbn') ??
-      '';
-
-    const myRating = parseRating(
-      $el.find(".note, .rating, [class*='note_']").first(),
-    );
-
-    const dateReadRaw = $el
-      .find(".date_read, .date-lu, [class*='date']")
-      .first()
-      .text()
-      .trim();
-    const dateRead = dateReadRaw
-      ? new Date(dateReadRaw).toISOString().split('T')[0]
-      : '';
-
-    const review = $el
-      .find('.review, .commentaire, .avis')
-      .first()
-      .text()
-      .trim();
-
-    books.push({
-      title,
-      author,
-      isbn,
-      myRating,
-      shelf: SHELF_MAP[shelf] ?? 'read',
-      dateRead,
-      dateAdded: new Date().toISOString().split('T')[0],
-      review,
-    });
-  });
-
-  const hasNext =
-    $("a.next, a[rel='next'], .pagination .next:not(.disabled)").length > 0;
-
-  return { books, hasNext };
-}
-
-async function fetchAllBooksForShelf(shelf: string): Promise<Book[]> {
-  const allBooks: Book[] = [];
-  let page = 1;
-  console.log(`  📚 Shelf "${shelf}"...`);
-
-  while (true) {
-    try {
-      const { books, hasNext } = await fetchBooksPage(shelf, page);
-      allBooks.push(...books);
-      console.log(`     Page ${page} → ${books.length} livre(s)`);
-      if (!hasNext) break;
-      page++;
-      await sleep(DELAY_MS);
-    } catch (err) {
-      console.error(`     ⚠️ Erreur page ${page} :`, (err as Error).message);
-      break;
+      for (const book of creatives) {
+        const { _prenom, _nom, nom } = book.person;
+        const author   = [_prenom, _nom].join(' ').trim() || nom;
+        const authorLF = [_nom, _prenom].filter(Boolean).join(', ') || nom;
+        books.push({ title: book.name, author, authorLF, shelf: mapping.shelf, myRating: mapping.rating, isbn: '', isbn13: '' });
+      }
     }
   }
 
-  return allBooks;
+  return books;
 }
 
-// ── CSV GOODREADS ─────────────────────────────────────────────────────────────
-function escapeCsv(value: string): string {
-  return value.includes(',') || value.includes('"') || value.includes('\n')
-    ? `"${value.replace(/"/g, '""')}"`
-    : value;
+// ── Step 4: ISBN resolution via Open Library ──────────────────────────────────
+async function resolveIsbn(title: string, author: string): Promise<{ isbn: string; isbn13: string }> {
+  const cleanTitle = title.replace(VOLUME_RE, '').trim();
+
+  for (const query of [{ title: cleanTitle, author }, { title: cleanTitle }]) {
+    try {
+      const { data } = await axios.get('https://openlibrary.org/search.json', {
+        params: { ...query, limit: 5, fields: 'isbn' },
+        timeout: 8000,
+      });
+      const docs = (data as { docs: Array<{ isbn?: string[] }> }).docs;
+      for (const doc of docs) {
+        if (!doc.isbn?.length) continue;
+        const i13 = doc.isbn.find((i) => i.length === 13 && /^97[89]/.test(i));
+        const i10 = doc.isbn.find((i) => i.length === 10);
+        if (i13 || i10) return { isbn: i10 ?? '', isbn13: i13 ?? '' };
+      }
+    } catch { /* timeout or rate-limit — skip */ }
+  }
+
+  return { isbn: '', isbn13: '' };
 }
 
-function booksToGoodreadsCsv(books: Book[]): string {
-  const columns = [
-    'Book Id',
-    'Title',
-    'Author',
-    'Author l-f',
-    'Additional Authors',
-    'ISBN',
-    'ISBN13',
-    'My Rating',
-    'Average Rating',
-    'Publisher',
-    'Binding',
-    'Number of Pages',
-    'Year Published',
-    'Original Publication Year',
-    'Date Read',
-    'Date Added',
-    'Bookshelves',
-    'Bookshelves with positions',
-    'Exclusive Shelf',
-    'My Review',
-    'Spoiler',
-    'Private Notes',
-    'Read Count',
-    'Owned Copies',
+async function resolveAllIsbns(books: Book[]): Promise<void> {
+  const CONCURRENCY = 5;
+  let found = 0;
+
+  console.log(`\n🔎 Resolving ISBNs via Open Library (${books.length} books)...`);
+
+  for (let i = 0; i < books.length; i += CONCURRENCY) {
+    const batch   = books.slice(i, i + CONCURRENCY);
+    const results = await Promise.all(batch.map((b) => resolveIsbn(b.title, b.author)));
+
+    for (let j = 0; j < batch.length; j++) {
+      batch[j].isbn   = results[j].isbn;
+      batch[j].isbn13 = results[j].isbn13;
+      if (results[j].isbn || results[j].isbn13) found++;
+    }
+
+    const done = Math.min(i + CONCURRENCY, books.length);
+    process.stdout.write(`\r   [${done}/${books.length}] ${Math.round((done / books.length) * 100)}% — ${found} ISBNs found   `);
+    if (done < books.length) await sleep(250);
+  }
+
+  console.log(`\n   ✅ ${found}/${books.length} ISBNs resolved (${Math.round((found / books.length) * 100)}%)\n`);
+}
+
+// ── CSV (Goodreads format) ────────────────────────────────────────────────────
+function escapeCsv(v: string): string {
+  return v.includes(',') || v.includes('"') || v.includes('\n')
+    ? `"${v.replace(/"/g, '""')}"`
+    : v;
+}
+
+function toCsv(books: Book[]): string {
+  const header = [
+    'Book Id', 'Title', 'Author', 'Author l-f', 'Additional Authors',
+    'ISBN', 'ISBN13', 'My Rating', 'Publisher', 'Binding',
+    'Number of Pages', 'Year Published', 'Original Publication Year',
+    'Date Read', 'Date Added', 'Bookshelves', 'Bookshelves with positions',
+    'Exclusive Shelf', 'My Review', 'Spoiler', 'Private Notes',
+    'Read Count', 'Owned Copies',
   ];
 
-  const rows = books.map((b, i) => {
-    const authorLF = b.author.includes(' ')
-      ? b.author.split(' ').reverse().join(', ')
-      : b.author;
+  // Use local date to avoid UTC-offset day shift
+  const d     = new Date();
+  const today = `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')}`;
 
-    return [
-      String(i + 1),
-      b.title,
-      b.author,
-      authorLF,
-      '',
-      b.isbn,
-      '',
-      String(b.myRating),
-      '',
-      '',
-      '',
-      '',
-      '',
-      '',
-      b.dateRead,
-      b.dateAdded,
-      b.shelf,
-      '',
-      b.shelf,
-      b.review,
-      '',
-      '',
-      b.shelf === 'read' ? '1' : '0',
-      '0',
-    ]
-      .map(escapeCsv)
-      .join(',');
-  });
+  // Goodreads expects ISBNs wrapped in ="..." to prevent Excel scientific notation
+  const rows = books.map((b, i) => [
+    String(i + 1), b.title, b.author, b.authorLF,
+    '', b.isbn ? `="${b.isbn}"` : '', b.isbn13 ? `="${b.isbn13}"` : '', String(b.myRating),
+    '', '', '', '', '',
+    '', today,
+    b.shelf, '', b.shelf,
+    '', '', '',
+    b.shelf === 'read' ? '1' : '0', '0',
+  ].map(escapeCsv).join(','));
 
-  return [columns.join(','), ...rows].join('\n');
+  return [header.join(','), ...rows].join('\n');
 }
 
-// ── MAIN ──────────────────────────────────────────────────────────────────────
+// ── Main ──────────────────────────────────────────────────────────────────────
 async function main() {
-  await login();
+  const userId  = await fetchUserId();
+  const library = await fetchLibrary(userId);
 
   if (DEBUG) {
-    await dumpHtml(DEBUG_SHELF ?? Object.keys(SHELF_MAP)[0]);
+    const out = `debug_api_${USERNAME}.json`;
+    writeFileSync(out, JSON.stringify(library, null, 2), 'utf8');
+    console.log(`✅ Raw API response saved → ${out}`);
     return;
   }
 
-  console.log(`🔮 Export BookNode → Goodreads CSV pour « ${USERNAME} »\n`);
+  console.log(`🔮 Exporting BookNode → Goodreads CSV for "${USERNAME}"\n`);
+  const books = extractBooks(library);
 
-  const allBooks: Book[] = [];
-  for (const shelf of Object.keys(SHELF_MAP)) {
-    allBooks.push(...(await fetchAllBooksForShelf(shelf)));
-    await sleep(DELAY_MS);
-  }
-
-  if (allBooks.length === 0) {
-    console.warn(
-      '⚠️  Aucun livre trouvé — les sélecteurs CSS ont peut-être changé.\n' +
-        `   Lance : npx ts-node booknode-export.ts ${USERNAME} --debug lu`,
-    );
+  if (books.length === 0) {
+    console.warn('⚠️  No books found — is the profile private?');
     process.exit(1);
   }
 
-  const csv = booksToGoodreadsCsv(allBooks);
-  const outFile = `booknode_${USERNAME}_export.csv`;
-  createWriteStream(outFile).end(csv, 'utf8');
+  if (!NO_ISBN) await resolveAllIsbns(books);
 
-  console.log(`\n✅ ${allBooks.length} livre(s) exporté(s) → ${outFile}`);
-  console.log(
-    '   Goodreads : Settings → Import books → Goodreads CSV\n' +
-      '   Pagebound : Settings → Import → Goodreads',
-  );
+  const outFile = `booknode_${USERNAME}_export.csv`;
+  writeFileSync(outFile, toCsv(books), 'utf8');
+
+  console.log(`✅ ${books.length} book(s) exported → ${outFile}`);
+  console.log('   Goodreads : Settings → Import books → Goodreads CSV');
+  console.log('   Pagebound : Settings → Import → Goodreads');
 }
 
 main().catch((err) => {
-  console.error('Erreur fatale :', err);
+  console.error('Fatal error:', err);
   process.exit(1);
 });
