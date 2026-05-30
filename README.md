@@ -34,18 +34,18 @@ Generates a file `booknode_<username_or_id>_export.csv`.
 
 BookNode has no individual star ratings — the list a book belongs to determines its exported rating.
 
-| BookNode list       | Goodreads shelf     | Stars |
-| ------------------- | ------------------- | ----- |
-| Liste de diamant    | read                | ★★★★★ |
-| Liste d'Or          | read                | ★★★★  |
-| Liste d'argent      | read                | ★★★   |
-| Liste de bronze     | read                | ★★    |
-| J'ai lu aussi       | read                | —     |
-| Mes envies          | to-read             | —     |
-| Ma PAL              | to-read             | —     |
-| En cours            | currently-reading   | —     |
-| Pas apprécié        | read                | —     |
-| Poubelle            | *(skipped)*         | —     |
+| BookNode list    | Goodreads shelf   | Stars |
+| ---------------- | ----------------- | ----- |
+| Liste de diamant | read              | ★★★★★ |
+| Liste d'Or       | read              | ★★★★  |
+| Liste d'argent   | read              | ★★★   |
+| Liste de bronze  | read              | ★★    |
+| J'ai lu aussi    | read              | —     |
+| Mes envies       | to-read           | —     |
+| Ma PAL           | to-read           | —     |
+| En cours         | currently-reading | —     |
+| Pas apprécié     | read              | —     |
+| Poubelle         | _(skipped)_       | —     |
 
 ## Debug mode
 

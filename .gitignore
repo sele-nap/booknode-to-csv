@@ -1,5 +1,6 @@
 node_modules/
 dist/
 *.csv
+debug_api_*.json
 *.html
 debug_api_*.json
